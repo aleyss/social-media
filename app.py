@@ -13,6 +13,11 @@ from dotenv import load_dotenv
 import os
 
 from agent import generate_social_content
+from groq import Groq
+client = Groq(
+    api_key=os.getenv("GROQ_API_KEY")
+)
+
 
 # Load environment variables
 load_dotenv()
