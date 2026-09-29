@@ -1,111 +1,163 @@
-"""
-Social Media Content Agent using CrewAI + Groq.
-
-Generates platform-optimized content for:
-- Twitter/X
-- LinkedIn
-- Instagram
-
-Uses Groq-hosted GPT-OSS 120B.
-"""
-
-import argparse
 import os
 from typing import Optional
 
+from dotenv import load_dotenv
+
 # ============================================================
-# LITELLM / GROQ COMPATIBILITY PATCH
+# LITELLM COMPATIBILITY PATCH FOR GROQ
 # ============================================================
 
 try:
     import litellm
 
-    # Ignore unsupported parameters passed by CrewAI/LiteLLM
+    # Ignore unsupported parameters
     litellm.drop_params = True
 
-    _orig_litellm_completion = litellm.completion
-    _orig_litellm_acompletion = litellm.acompletion
+    # Save original functions
+    _original_completion = litellm.completion
+    _original_acompletion = litellm.acompletion
 
-    def _strip_cache_breakpoints(messages):
-        """Remove cache_breakpoint parameters unsupported by Groq."""
+    def remove_cache_breakpoint(messages):
+        """
+        Remove cache_breakpoint because Groq does not
+        accept this parameter.
+        """
 
         if isinstance(messages, list):
+
             for message in messages:
+
                 if isinstance(message, dict):
                     message.pop("cache_breakpoint", None)
 
+                    # Also check nested content
+                    if isinstance(message.get("content"), list):
+
+                        for item in message["content"]:
+
+                            if isinstance(item, dict):
+                                item.pop(
+                                    "cache_breakpoint",
+                                    None
+                                )
+
         elif isinstance(messages, dict):
-            messages.pop("cache_breakpoint", None)
 
-    def _safe_completion(*args, **kwargs):
-        """Safe wrapper for synchronous LiteLLM calls."""
+            messages.pop(
+                "cache_breakpoint",
+                None
+            )
 
-        if "messages" in kwargs:
-            _strip_cache_breakpoints(kwargs["messages"])
+    # --------------------------------------------------------
+    # Safe synchronous completion
+    # --------------------------------------------------------
 
-        elif len(args) > 1 and isinstance(args[1], list):
-            _strip_cache_breakpoints(args[1])
-
-        return _orig_litellm_completion(*args, **kwargs)
-
-    async def _safe_acompletion(*args, **kwargs):
-        """Safe wrapper for asynchronous LiteLLM calls."""
+    def safe_completion(*args, **kwargs):
 
         if "messages" in kwargs:
-            _strip_cache_breakpoints(kwargs["messages"])
+            remove_cache_breakpoint(
+                kwargs["messages"]
+            )
 
-        elif len(args) > 1 and isinstance(args[1], list):
-            _strip_cache_breakpoints(args[1])
+        elif len(args) > 1:
+            if isinstance(args[1], list):
+                remove_cache_breakpoint(
+                    args[1]
+                )
 
-        return await _orig_litellm_acompletion(*args, **kwargs)
+        return _original_completion(
+            *args,
+            **kwargs
+        )
 
-    litellm.completion = _safe_completion
-    litellm.acompletion = _safe_acompletion
+    # --------------------------------------------------------
+    # Safe asynchronous completion
+    # --------------------------------------------------------
+
+    async def safe_acompletion(*args, **kwargs):
+
+        if "messages" in kwargs:
+            remove_cache_breakpoint(
+                kwargs["messages"]
+            )
+
+        elif len(args) > 1:
+            if isinstance(args[1], list):
+                remove_cache_breakpoint(
+                    args[1]
+                )
+
+        return await _original_acompletion(
+            *args,
+            **kwargs
+        )
+
+    # Replace LiteLLM functions
+    litellm.completion = safe_completion
+    litellm.acompletion = safe_acompletion
 
 except ImportError:
+
     pass
 
 
 # ============================================================
-# CREWAI CACHE BREAKPOINT PATCH
+# CREWAI CACHE PATCH
 # ============================================================
 
 try:
-    import crewai.llms.cache as _c
 
-    _c.mark_cache_breakpoint = lambda msg: msg
+    import crewai.llms.cache as crew_cache
 
-except Exception:
-    pass
-
-
-try:
-    import crewai.agents.crew_agent_executor as _cae
-
-    _cae.mark_cache_breakpoint = lambda msg: msg
+    crew_cache.mark_cache_breakpoint = (
+        lambda message: message
+    )
 
 except Exception:
+
     pass
 
 
 try:
-    import crewai.experimental.agent_executor as _eae
 
-    _eae.mark_cache_breakpoint = lambda msg: msg
+    import crewai.agents.crew_agent_executor as executor
+
+    executor.mark_cache_breakpoint = (
+        lambda message: message
+    )
 
 except Exception:
+
+    pass
+
+
+try:
+
+    import crewai.experimental.agent_executor as experimental_executor
+
+    experimental_executor.mark_cache_breakpoint = (
+        lambda message: message
+    )
+
+except Exception:
+
     pass
 
 
 # ============================================================
-# IMPORT CREWAI
+# CREWAI IMPORT
 # ============================================================
 
-from crewai import Agent, Crew, LLM, Process, Task
-from dotenv import load_dotenv
+from crewai import (
+    Agent,
+    Crew,
+    LLM,
+    Process,
+    Task
+)
 
 
-# Load variables from .env
+# Load .env
 load_dotenv()
 
 
@@ -116,37 +168,42 @@ load_dotenv()
 def build_llm(
     model: str = "openai/gpt-oss-120b",
     api_key: Optional[str] = None,
-    temperature: float = 0.7,
-) -> LLM:
-    """
-    Create a CrewAI LLM using Groq only.
+    temperature: float = 0.7
+):
 
-    The model is hosted by Groq.
-    """
+    # Get API key
+    key = (
+        api_key
+        or os.getenv("GROQ_API_KEY")
+    )
 
-    # Get API key from argument or .env
-    key = api_key or os.getenv("GROQ_API_KEY")
-
-    # Check API key
     if not key:
+
         raise ValueError(
-            "Groq API key is missing.\n"
+            "Groq API key is missing. "
             "Please add GROQ_API_KEY to your .env file."
         )
 
-    # Store key in environment
+    # Save key to environment
     os.environ["GROQ_API_KEY"] = key
 
-    # Make sure model has the Groq prefix
+    # Make sure Groq provider prefix exists
     if not model.startswith("groq/"):
+
         model = f"groq/{model}"
 
     # Create CrewAI LLM
-    return LLM(
+    llm = LLM(
+
         model=model,
+
         api_key=key,
-        temperature=temperature,
+
+        temperature=temperature
+
     )
+
+    return llm
 
 
 # ============================================================
@@ -158,177 +215,216 @@ def generate_social_content(
     brand: str = "",
     platforms: Optional[list[str]] = None,
     api_key: Optional[str] = None,
-    model: Optional[str] = None,
-) -> str:
+    model: str = "openai/gpt-oss-120b"
+):
 
-    # Default platforms
+    # --------------------------------------------------------
+    # DEFAULT PLATFORMS
+    # --------------------------------------------------------
+
     if platforms is None:
+
         platforms = [
             "twitter",
             "linkedin",
-            "instagram",
+            "instagram"
         ]
 
     # --------------------------------------------------------
-    # CREATE LLM
+    # CREATE GROQ LLM
     # --------------------------------------------------------
 
     llm = build_llm(
-        model=model or "openai/gpt-oss-120b",
+
+        model=model,
+
         api_key=api_key,
-        temperature=0.7,
+
+        temperature=0.7
+
     )
 
     # ========================================================
-    # AGENT 1: SOCIAL MEDIA STRATEGIST
+    # AGENT 1
+    # SOCIAL MEDIA STRATEGIST
     # ========================================================
 
     strategist = Agent(
+
         role="Social Media Strategist",
 
         goal=(
-            "Analyze the topic and create a clear social media "
-            "strategy for each requested platform."
+            "Analyze the topic and create a practical "
+            "social media strategy for the selected platforms."
         ),
 
         backstory=(
             "You are an experienced social media strategist "
-            "specializing in audience engagement, content strategy, "
-            "platform-specific communication, hooks, and hashtags."
+            "who understands audience engagement, hooks, "
+            "content strategy, tone of voice and hashtags."
         ),
 
         llm=llm,
 
-        verbose=False,
+        verbose=False
+
     )
 
     # ========================================================
-    # AGENT 2: SOCIAL MEDIA COPYWRITER
+    # AGENT 2
+    # SOCIAL MEDIA COPYWRITER
     # ========================================================
 
     writer = Agent(
+
         role="Social Media Copywriter",
 
         goal=(
-            "Create engaging, platform-optimized social media "
-            "content that matches the strategy."
+            "Create engaging and platform-specific "
+            "social media content."
         ),
 
         backstory=(
-            "You are an expert social media copywriter who understands "
-            "Twitter/X, LinkedIn, and Instagram formats, hooks, "
-            "storytelling, hashtags, and audience engagement."
+            "You are an expert social media copywriter "
+            "specializing in Twitter/X, LinkedIn and Instagram."
         ),
 
         llm=llm,
 
-        verbose=False,
+        verbose=False
+
     )
 
     # ========================================================
-    # TASK 1: CREATE STRATEGY
+    # TASK 1
+    # CREATE STRATEGY
     # ========================================================
 
     strategy_task = Task(
 
         description=f"""
-Analyze the following topic for social media marketing.
 
-Topic:
+Analyze the following topic for social media.
+
+TOPIC:
 {topic}
 
-Brand:
-{brand or "Not specified"}
+BRAND:
+{brand if brand else "Not specified"}
 
-Platforms:
+SELECTED PLATFORMS:
 {", ".join(platforms)}
 
-Create a social media strategy containing:
+Create a strategy containing:
 
 1. Core message
 2. Target audience
 3. Emotional hook
 4. Tone of voice
-5. Key points to communicate
+5. Key points
 6. Five relevant hashtags
 
-Make the strategy practical and platform-aware.
+Make the strategy practical and platform-specific.
+
 """,
 
         agent=strategist,
 
         expected_output=(
-            "A clear content strategy containing "
-            "the core message, audience, emotional hook, "
-            "tone, key points, and hashtags."
-        ),
+            "A clear social media strategy containing "
+            "the core message, audience, hook, tone, "
+            "key points and hashtags."
+        )
+
     )
 
     # ========================================================
-    # TASK 2: WRITE CONTENT
+    # TASK 2
+    # CREATE CONTENT
     # ========================================================
 
     writing_task = Task(
 
         description=f"""
-Create social media content for the following topic.
 
-Topic:
+Create social media content using the strategy
+created by the Social Media Strategist.
+
+TOPIC:
 {topic}
 
-Brand:
-{brand or "General"}
+BRAND:
+{brand if brand else "General"}
 
-Platforms:
+SELECTED PLATFORMS:
 {", ".join(platforms)}
-
-Use the strategy created by the Social Media Strategist.
 
 IMPORTANT:
 
-For Twitter/X:
+Only generate content for the platforms selected
+by the user.
+
+Do not generate content for unselected platforms.
+
+--------------------------------------------------
+TWITTER / X
+--------------------------------------------------
+
+If Twitter/X is selected:
 
 - Create 2 tweet variations.
 - Each tweet must be under 280 characters.
-- Make them short, punchy, and engaging.
-- Also create a thread opener.
+- Make them short and engaging.
+- Create one thread opener.
 
-For LinkedIn:
+--------------------------------------------------
+LINKEDIN
+--------------------------------------------------
+
+If LinkedIn is selected:
 
 - Create one professional post.
 - 150–200 words.
 - Start with a strong storytelling hook.
 - Use short paragraphs.
-- Make it informative and professional.
-- End with an engaging question or call to action.
+- Include useful insights.
+- End with a question or call to action.
 
-For Instagram:
+--------------------------------------------------
+INSTAGRAM
+--------------------------------------------------
 
-- Create one caption.
+If Instagram is selected:
+
+- Create one engaging caption.
 - 100–150 words.
-- Make it visual and engaging.
-- Use an appropriate call to action.
-- Add 15 relevant hashtags.
+- Use a strong hook.
+- Include a call to action.
+- Add exactly 15 relevant hashtags.
+
+--------------------------------------------------
 
 Make every platform version unique.
 
-Do NOT simply copy the same content across platforms.
-
-Return the final answer with clear headings:
+Use clear headings:
 
 TWITTER/X
+
 LINKEDIN
+
 INSTAGRAM
+
 """,
 
         agent=writer,
 
         expected_output=(
-            "Platform-optimized social media content for "
-            "Twitter/X, LinkedIn, and Instagram."
+            "High-quality platform-specific social media "
+            "content for the selected platforms."
         ),
 
-        context=[strategy_task],
+        context=[strategy_task]
+
     )
 
     # ========================================================
@@ -339,17 +435,18 @@ INSTAGRAM
 
         agents=[
             strategist,
-            writer,
+            writer
         ],
 
         tasks=[
             strategy_task,
-            writing_task,
+            writing_task
         ],
 
         process=Process.sequential,
 
-        verbose=False,
+        verbose=False
+
     )
 
     # ========================================================
@@ -359,148 +456,3 @@ INSTAGRAM
     result = crew.kickoff()
 
     return str(result)
-
-
-# ============================================================
-# COMMAND LINE INTERFACE
-# ============================================================
-
-def main():
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Social Media Content Agent "
-            "(CrewAI + Groq)"
-        )
-    )
-
-    # --------------------------------------------------------
-    # TOPIC
-    # --------------------------------------------------------
-
-    parser.add_argument(
-        "--topic",
-        default=(
-            "How AI is transforming "
-            "software development in 2026"
-        ),
-        help="Content topic",
-    )
-
-    # --------------------------------------------------------
-    # BRAND
-    # --------------------------------------------------------
-
-    parser.add_argument(
-        "--brand",
-        default="",
-        help="Brand name (optional)",
-    )
-
-    # --------------------------------------------------------
-    # PLATFORMS
-    # --------------------------------------------------------
-
-    parser.add_argument(
-        "--platforms",
-        default="twitter,linkedin,instagram",
-        help="Comma-separated platforms",
-    )
-
-    # --------------------------------------------------------
-    # MODEL
-    # --------------------------------------------------------
-
-    parser.add_argument(
-        "--model",
-        default="openai/gpt-oss-120b",
-        help="Groq-hosted model",
-    )
-
-    # --------------------------------------------------------
-    # API KEY
-    # --------------------------------------------------------
-
-    parser.add_argument(
-        "--api-key",
-        default=None,
-        help="Groq API key",
-    )
-
-    # Parse arguments
-    args = parser.parse_args()
-
-    # Convert platform string to list
-    platforms = [
-        platform.strip()
-        for platform in args.platforms.split(",")
-    ]
-
-    # ========================================================
-    # DISPLAY SETTINGS
-    # ========================================================
-
-    print()
-    print("=" * 60)
-    print("🤖 SOCIAL MEDIA CONTENT AGENT")
-    print("=" * 60)
-
-    print(f"⚡ Provider  : GROQ")
-    print(f"🤖 Model     : {args.model}")
-    print(f"📱 Platforms : {', '.join(platforms)}")
-    print(f"📌 Topic     : {args.topic}")
-
-    print("=" * 60)
-    print()
-
-    # ========================================================
-    # GENERATE CONTENT
-    # ========================================================
-
-    try:
-
-        content = generate_social_content(
-            topic=args.topic,
-            brand=args.brand,
-            platforms=platforms,
-            api_key=args.api_key,
-            model=args.model,
-        )
-
-        # ====================================================
-        # DISPLAY RESULT
-        # ====================================================
-
-        print("=" * 60)
-        print("✍️ SOCIAL MEDIA CONTENT")
-        print("=" * 60)
-
-        print(content)
-
-        print()
-        print("=" * 60)
-        print("✅ Content generation completed successfully!")
-        print("=" * 60)
-
-    except Exception as e:
-
-        print()
-        print("=" * 60)
-        print("❌ ERROR GENERATING CONTENT")
-        print("=" * 60)
-
-        print(str(e))
-
-        print()
-        print(
-            "Please check your GROQ_API_KEY and "
-            "Groq model availability."
-        )
-
-
-# ============================================================
-# RUN APPLICATION
-# ============================================================
-
-if __name__ == "__main__":
-    main()
